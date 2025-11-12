@@ -362,6 +362,14 @@ func runJobs(ctx context.Context, src JobSource, maxParallel int, stopOnError bo
 	return successCount, failCount, totalJobs, iterationErr
 }
 
+func isTerminal(f *os.File) bool {
+	stat, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return stat.Mode()&os.ModeCharDevice != 0
+}
+
 func runOne(ctx context.Context, job Job, printCmd bool, onStarted func()) (int, error) {
 	if job.Cmd == "" {
 		return 1, errors.New("empty command")
@@ -390,13 +398,35 @@ func runOne(ctx context.Context, job Job, printCmd bool, onStarted func()) (int,
 		}
 	}()
 
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return 1, err
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return 1, err
+	// Check if stdout/stderr are terminals to preserve colors
+	stdoutIsTTY := isTerminal(os.Stdout)
+	stderrIsTTY := isTerminal(os.Stderr)
+
+	var wg sync.WaitGroup
+	if stdoutIsTTY && stderrIsTTY {
+		// Direct output to preserve colors
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	} else {
+		// Use pipes when not a TTY (e.g., redirected output)
+		stdoutPipe, err := cmd.StdoutPipe()
+		if err != nil {
+			return 1, err
+		}
+		stderrPipe, err := cmd.StderrPipe()
+		if err != nil {
+			return 1, err
+		}
+
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = io.Copy(os.Stdout, stdoutPipe)
+		}()
+		go func() {
+			defer wg.Done()
+			_, _ = io.Copy(os.Stderr, stderrPipe)
+		}()
 	}
 
 	if printCmd {
@@ -408,17 +438,6 @@ func runOne(ctx context.Context, job Job, printCmd bool, onStarted func()) (int,
 	}
 	release()
 	released = true
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(os.Stdout, stdoutPipe)
-	}()
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(os.Stderr, stderrPipe)
-	}()
 
 	waitErr := cmd.Wait()
 	wg.Wait()
