@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 )
 
 type Job struct {
@@ -25,39 +24,181 @@ type Job struct {
 	Cwd  string
 }
 
-type JobResult struct {
-	JobID     string
-	ExitCode  int
-	Err       error
-	StartedAt time.Time
-	EndedAt   time.Time
+type JobSource interface {
+	Next(ctx context.Context) (Job, bool, error)
+	Close() error
+}
+
+type scannerJobSource struct {
+	scanner    *bufio.Scanner
+	closer     io.Closer
+	binPath    string
+	sharedArgs []string
+	index      int
+}
+
+func newJobSource(binPath string, sharedArgs []string, path string) (JobSource, error) {
+	var (
+		reader io.Reader
+		closer io.Closer
+	)
+	if path == "" {
+		reader = os.Stdin
+	} else {
+		f, err := os.Open(filepath.Clean(path))
+		if err != nil {
+			return nil, err
+		}
+		reader = f
+		closer = f
+	}
+
+	sc := bufio.NewScanner(reader)
+	buf := make([]byte, 0, 64*1024)
+	sc.Buffer(buf, 10*1024*1024)
+
+	return &scannerJobSource{
+		scanner:    sc,
+		closer:     closer,
+		binPath:    binPath,
+		sharedArgs: append([]string(nil), sharedArgs...),
+	}, nil
+}
+
+func (s *scannerJobSource) Next(ctx context.Context) (Job, bool, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return Job{}, false, err
+		}
+		if !s.scanner.Scan() {
+			if err := s.scanner.Err(); err != nil {
+				return Job{}, false, err
+			}
+			return Job{}, false, nil
+		}
+		line := strings.TrimSpace(s.scanner.Text())
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		s.index++
+		args := make([]string, 0, len(s.sharedArgs)+len(fields))
+		args = append(args, s.sharedArgs...)
+		args = append(args, fields...)
+		job := Job{
+			ID:   fmt.Sprintf("%s-%d", filepath.Base(s.binPath), s.index),
+			Cmd:  s.binPath,
+			Args: args,
+		}
+		return job, true, nil
+	}
+}
+
+func (s *scannerJobSource) Close() error {
+	if s.closer != nil {
+		return s.closer.Close()
+	}
+	return nil
 }
 
 func main() {
 	var (
 		inputFile    string
 		binPath      string
-		sharedArgs   []string
 		maxParallel  int
 		stopOnError  bool
 		workingDir   string
 		printVersion bool
+		printCmd     bool
 	)
 
-	flag.StringVar(&inputFile, "f", "", "Text file with one argument per line. Use '-' for stdin.")
-	flag.StringVar(&binPath, "b", "", "Executable path to run for each job.")
-	flag.IntVar(&maxParallel, "p", 4, "Maximum jobs to run concurrently.")
-	flag.BoolVar(&stopOnError, "x", false, "Cancel remaining jobs after the first failure.")
-	flag.StringVar(&workingDir, "C", "", "Change directory before running any jobs.")
-	flag.BoolVar(&printVersion, "V", false, "Print version and exit.")
-	flag.Func("a", "Shared argument appended to every job (repeatable).", func(value string) error {
-		if value == "" {
-			return nil
+	args := os.Args[1:]
+	coreArgs := make([]string, 0, len(args))
+	sharedArgs := make([]string, 0)
+	var (
+		useStdin  bool
+		sawShared bool
+	)
+	for i := 0; i < len(args); {
+		token := args[i]
+		switch token {
+		case "--":
+			if useStdin {
+				fmt.Fprintln(os.Stderr, "error: '--' may only be provided once")
+				os.Exit(2)
+			}
+			useStdin = true
+			if i != len(args)-1 {
+				fmt.Fprintln(os.Stderr, "error: '--' must be the final argument")
+				os.Exit(2)
+			}
+			i = len(args)
+		case "-a":
+			if sawShared {
+				fmt.Fprintln(os.Stderr, "error: '-a' may only be provided once")
+				os.Exit(2)
+			}
+			sawShared = true
+			i++
+			for i < len(args) {
+				if args[i] == "--" {
+					if useStdin {
+						fmt.Fprintln(os.Stderr, "error: '--' may only be provided once")
+						os.Exit(2)
+					}
+					useStdin = true
+					if i != len(args)-1 {
+						fmt.Fprintln(os.Stderr, "error: '--' must be the final argument")
+						os.Exit(2)
+					}
+					i = len(args)
+					break
+				}
+				if args[i] == "-a" {
+					fmt.Fprintln(os.Stderr, "error: '-a' may only be provided once")
+					os.Exit(2)
+				}
+				sharedArgs = append(sharedArgs, args[i])
+				i++
+			}
+		default:
+			coreArgs = append(coreArgs, token)
+			i++
 		}
-		sharedArgs = append(sharedArgs, value)
-		return nil
-	})
-	flag.Parse()
+	}
+
+	fs := flag.NewFlagSet("runjobs", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.Usage = func() {
+		out := fs.Output()
+		fmt.Fprintf(out, "Usage: %s -b path [-f jobs.txt | --] [-p N] [-x] [-C dir] [-e] [-a shared... [--]]\n", os.Args[0])
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Options:")
+		fs.PrintDefaults()
+		fmt.Fprintln(out, "  -a shared...      append shared arguments to every job; must be last option")
+		fmt.Fprintln(out, "  --                optional sentinel that must be last argument; read jobs from stdin")
+	}
+	fs.StringVar(&inputFile, "f", "", "Text file with one job per line (default: stdin).")
+	fs.StringVar(&binPath, "b", "", "Executable path to run for each job.")
+	fs.IntVar(&maxParallel, "p", 4, "Maximum jobs to run concurrently.")
+	fs.BoolVar(&stopOnError, "x", false, "Cancel remaining jobs after the first failure.")
+	fs.StringVar(&workingDir, "C", "", "Change directory before running any jobs.")
+	fs.BoolVar(&printVersion, "V", false, "Print version and exit.")
+	fs.BoolVar(&printCmd, "e", false, "Echo each job's command and arguments before execution.")
+	if err := fs.Parse(coreArgs); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		os.Exit(2)
+	}
+
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "error: unexpected positional arguments: %s\n", strings.Join(fs.Args(), " "))
+		os.Exit(2)
+	}
 
 	if printVersion {
 		fmt.Println("mytools runjobs v0.1.0")
@@ -68,8 +209,21 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error: -b is required (path to executable to run)")
 		os.Exit(2)
 	}
-	if inputFile == "" {
-		fmt.Fprintln(os.Stderr, "error: -f is required (use a text file or '-')")
+
+	resolvedBin, err := ensureExecutable(binPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
+	binPath = resolvedBin
+
+	if useStdin {
+		if inputFile != "" {
+			fmt.Fprintln(os.Stderr, "error: cannot combine -f with '--'")
+			os.Exit(2)
+		}
+	} else if inputFile == "" {
+		fmt.Fprintln(os.Stderr, "error: provide -f <file> or terminate arguments with '--' to read from stdin")
 		os.Exit(2)
 	}
 
@@ -80,16 +234,12 @@ func main() {
 		}
 	}
 
-	jobs, err := loadJobsFromInput(binPath, sharedArgs, inputFile)
+	jobSrc, err := newJobSource(binPath, sharedArgs, inputFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: load jobs: %v\n", err)
 		os.Exit(2)
 	}
-
-	if len(jobs) == 0 {
-		fmt.Fprintln(os.Stderr, "error: no jobs found")
-		os.Exit(2)
-	}
+	defer func() { _ = jobSrc.Close() }()
 
 	if maxParallel <= 0 {
 		maxParallel = 1
@@ -107,118 +257,112 @@ func main() {
 		cancel()
 	}()
 
-	successCount, failCount := runJobs(ctx, jobs, maxParallel, stopOnError)
+	successCount, failCount, totalJobs, runErr := runJobs(ctx, jobSrc, maxParallel, stopOnError, printCmd)
+	if runErr != nil && !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, context.DeadlineExceeded) {
+		fmt.Fprintf(os.Stderr, "error: %v\n", runErr)
+		os.Exit(2)
+	}
 
-	fmt.Printf("jobs total=%d success=%d failed=%d\n", len(jobs), successCount, failCount)
+	fmt.Printf("jobs total=%d success=%d failed=%d\n", totalJobs, successCount, failCount)
 
 	if failCount > 0 {
 		os.Exit(1)
 	}
 }
 
-func loadJobsFromInput(binPath string, sharedArgs []string, path string) ([]Job, error) {
-	var r io.Reader
-	if path == "-" {
-		r = os.Stdin
-	} else {
-		f, err := os.Open(filepath.Clean(path))
-		if err != nil {
-			return nil, err
-		}
-		defer func() { _ = f.Close() }()
-		r = f
-	}
-	sc := bufio.NewScanner(r)
-	buf := make([]byte, 0, 64*1024)
-	sc.Buffer(buf, 10*1024*1024)
-	var jobs []Job
-	for sc.Scan() {
-		arg := sc.Text()
-		arg = strings.TrimSpace(arg)
-		if arg == "" {
-			continue
-		}
-		fields := strings.Fields(arg)
-		if len(fields) == 0 {
-			continue
-		}
-		jobArgs := make([]string, 0, len(sharedArgs)+len(fields))
-		jobArgs = append(jobArgs, sharedArgs...)
-		jobArgs = append(jobArgs, fields...)
-		jobs = append(jobs, Job{
-			ID:   fmt.Sprintf("%s-%d", filepath.Base(binPath), len(jobs)+1),
-			Cmd:  binPath,
-			Args: jobArgs,
-		})
-	}
-	if err := sc.Err(); err != nil {
-		return nil, err
-	}
-	return jobs, nil
-}
-
-func runJobs(ctx context.Context, jobs []Job, maxParallel int, stopOnError bool) (int, int) {
+func runJobs(ctx context.Context, src JobSource, maxParallel int, stopOnError bool, printCmd bool) (int, int, int, error) {
 	sema := make(chan struct{}, maxParallel)
 	var (
-		wg       sync.WaitGroup
-		results  = make([]JobResult, len(jobs))
-		onceFail sync.Once
-		cancelFn context.CancelFunc
+		wg           sync.WaitGroup
+		onceFail     sync.Once
+		cancelFn     context.CancelFunc
+		startMu      sync.Mutex
+		startCond    = sync.NewCond(&startMu)
+		nextToStart  int
+		countMu      sync.Mutex
+		successCount int
+		failCount    int
+		totalJobs    int
 	)
 	ctx, cancelFn = context.WithCancel(ctx)
 	defer cancelFn()
 
-	for i := range jobs {
+	var iterationErr error
+
+	for {
+		job, ok, err := src.Next(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				break
+			}
+			iterationErr = err
+			break
+		}
+		if !ok {
+			break
+		}
+		idx := totalJobs
+		totalJobs++
+
 		wg.Add(1)
-		i := i
-		go func() {
+		go func(job Job, idx int) {
 			defer wg.Done()
+
+			releaseOnce := func() {
+				startMu.Lock()
+				if nextToStart == idx {
+					nextToStart++
+					startCond.Broadcast()
+				}
+				startMu.Unlock()
+			}
+			released := false
+			release := func() {
+				if !released {
+					released = true
+					releaseOnce()
+				}
+			}
+			defer release()
+
 			select {
 			case sema <- struct{}{}:
-				// acquired
 				defer func() { <-sema }()
 			case <-ctx.Done():
-				results[i] = JobResult{
-					JobID:    jobs[i].ID,
-					ExitCode: 1,
-					Err:      ctx.Err(),
-				}
+				countMu.Lock()
+				failCount++
+				countMu.Unlock()
 				return
 			}
 
-			start := time.Now()
-			exitCode, err := runOne(ctx, jobs[i])
-			end := time.Now()
-			results[i] = JobResult{
-				JobID:     jobs[i].ID,
-				ExitCode:  exitCode,
-				Err:       err,
-				StartedAt: start,
-				EndedAt:   end,
+			startMu.Lock()
+			for idx != nextToStart {
+				startCond.Wait()
 			}
+			startMu.Unlock()
 
-			if stopOnError && (err != nil || exitCode != 0) {
-				onceFail.Do(func() { cancelFn() })
+			exitCode, err := runOne(ctx, job, printCmd, release)
+			if err != nil || exitCode != 0 {
+				countMu.Lock()
+				failCount++
+				countMu.Unlock()
+				if stopOnError {
+					onceFail.Do(func() { cancelFn() })
+				}
+			} else {
+				countMu.Lock()
+				successCount++
+				countMu.Unlock()
 			}
-		}()
+		}(job, idx)
 	}
 
 	wg.Wait()
-	var (
-		successCount int
-		failCount    int
-	)
-	for _, r := range results {
-		if r.ExitCode == 0 && r.Err == nil {
-			successCount++
-		} else {
-			failCount++
-		}
-	}
-	return successCount, failCount
+
+	return successCount, failCount, totalJobs, iterationErr
 }
 
-func runOne(ctx context.Context, job Job) (int, error) {
+func runOne(ctx context.Context, job Job, printCmd bool, onStarted func()) (int, error) {
 	if job.Cmd == "" {
 		return 1, errors.New("empty command")
 	}
@@ -234,6 +378,18 @@ func runOne(ctx context.Context, job Job) (int, error) {
 		}
 	}
 
+	release := func() {
+		if onStarted != nil {
+			onStarted()
+		}
+	}
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return 1, err
@@ -243,9 +399,15 @@ func runOne(ctx context.Context, job Job) (int, error) {
 		return 1, err
 	}
 
+	if printCmd {
+		fmt.Printf("+ %s\n", formatCommand(job.Cmd, job.Args))
+	}
+
 	if err := cmd.Start(); err != nil {
 		return 1, err
 	}
+	release()
+	released = true
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -276,4 +438,51 @@ func runOne(ctx context.Context, job Job) (int, error) {
 		}
 	}
 	return exitCode, waitErr
+}
+
+func formatCommand(cmd string, args []string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, shellQuote(cmd))
+	for _, a := range args {
+		parts = append(parts, shellQuote(a))
+	}
+	return strings.Join(parts, " ")
+}
+
+func shellQuote(s string) string {
+	const specialChars = "\"#$&()*;<>?[\\]^`{|}~"
+	if s == "" {
+		return "''"
+	}
+	needs := false
+	for _, r := range s {
+		if r == '\'' {
+			return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
+		}
+		if r <= ' ' || strings.ContainsRune(specialChars, r) {
+			needs = true
+		}
+	}
+	if needs {
+		return "'" + s + "'"
+	}
+	return s
+}
+
+func ensureExecutable(bin string) (string, error) {
+	resolved, err := exec.LookPath(bin)
+	if err != nil {
+		return "", fmt.Errorf("executable %q not found: %w", bin, err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("stat %q: %w", resolved, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("executable %q is a directory", resolved)
+	}
+	if info.Mode()&0111 == 0 {
+		return "", fmt.Errorf("executable %q is not marked executable", resolved)
+	}
+	return resolved, nil
 }
