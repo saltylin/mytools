@@ -280,12 +280,45 @@ func runJobs(ctx context.Context, src JobSource, maxParallel int, stopOnError bo
 		startCond    = sync.NewCond(&startMu)
 		nextToStart  int
 		countMu      sync.Mutex
+		progressMu   sync.Mutex
 		successCount int
 		failCount    int
 		totalJobs    int
+		finishedJobs int
 	)
 	ctx, cancelFn = context.WithCancel(ctx)
 	defer cancelFn()
+
+	// Setup progress bar if TTY
+	showProgress := isTerminal(os.Stdout)
+	if showProgress {
+		// Save cursor position
+		fmt.Print("\033[s")
+	}
+
+	updateProgress := func() {
+		if !showProgress {
+			return
+		}
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		countMu.Lock()
+		finished := finishedJobs
+		total := totalJobs
+		success := successCount
+		failed := failCount
+		countMu.Unlock()
+		// Save current position, move to bottom, print progress, restore position
+		fmt.Print("\033[s")      // Save cursor
+		fmt.Print("\033[999;1H") // Move to row 999, col 1 (bottom)
+		fmt.Print("\033[K")      // Clear line
+		if total > 0 {
+			fmt.Print("\033[32m") // Green color
+			fmt.Printf("[%d/%d] jobs completed (success: %d, failed: %d)", finished, total, success, failed)
+			fmt.Print("\033[0m") // Reset color
+		}
+		fmt.Print("\033[u") // Restore cursor
+	}
 
 	var iterationErr error
 
@@ -302,7 +335,10 @@ func runJobs(ctx context.Context, src JobSource, maxParallel int, stopOnError bo
 			break
 		}
 		idx := totalJobs
+		countMu.Lock()
 		totalJobs++
+		countMu.Unlock()
+		updateProgress()
 
 		wg.Add(1)
 		go func(job Job, idx int) {
@@ -331,7 +367,9 @@ func runJobs(ctx context.Context, src JobSource, maxParallel int, stopOnError bo
 			case <-ctx.Done():
 				countMu.Lock()
 				failCount++
+				finishedJobs++
 				countMu.Unlock()
+				updateProgress()
 				return
 			}
 
@@ -342,22 +380,30 @@ func runJobs(ctx context.Context, src JobSource, maxParallel int, stopOnError bo
 			startMu.Unlock()
 
 			exitCode, err := runOne(ctx, job, printCmd, release)
+			countMu.Lock()
+			finishedJobs++
 			if err != nil || exitCode != 0 {
-				countMu.Lock()
 				failCount++
-				countMu.Unlock()
-				if stopOnError {
-					onceFail.Do(func() { cancelFn() })
-				}
 			} else {
-				countMu.Lock()
 				successCount++
-				countMu.Unlock()
+			}
+			countMu.Unlock()
+
+			updateProgress()
+
+			if (err != nil || exitCode != 0) && stopOnError {
+				onceFail.Do(func() { cancelFn() })
 			}
 		}(job, idx)
 	}
 
 	wg.Wait()
+
+	// Clear progress bar
+	if showProgress {
+		fmt.Print("\033[999;1H\033[K") // Move to bottom and clear
+		fmt.Print("\033[u")            // Restore original cursor position
+	}
 
 	return successCount, failCount, totalJobs, iterationErr
 }
