@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 type Job struct {
@@ -106,13 +107,14 @@ func (s *scannerJobSource) Close() error {
 
 func main() {
 	var (
-		inputFile    string
-		binPath      string
-		maxParallel  int
-		stopOnError  bool
-		workingDir   string
-		printVersion bool
-		printCmd     bool
+		inputFile       string
+		binPath         string
+		maxParallel     int
+		stopOnError     bool
+		workingDir      string
+		printVersion    bool
+		printCmd        bool
+		warningDuration int
 	)
 
 	args := os.Args[1:]
@@ -188,6 +190,7 @@ func main() {
 	fs.StringVar(&workingDir, "C", "", "Change directory before running any jobs.")
 	fs.BoolVar(&printVersion, "V", false, "Print version and exit.")
 	fs.BoolVar(&printCmd, "e", false, "Echo each job's command and arguments before execution.")
+	fs.IntVar(&warningDuration, "w", 600, "Warning threshold in seconds for long-running jobs (default: 600).")
 	if err := fs.Parse(coreArgs); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return
@@ -257,7 +260,7 @@ func main() {
 		cancel()
 	}()
 
-	successCount, failCount, totalJobs, runErr := runJobs(ctx, jobSrc, maxParallel, stopOnError, printCmd)
+	successCount, failCount, totalJobs, runErr := runJobs(ctx, jobSrc, maxParallel, stopOnError, printCmd, time.Duration(warningDuration)*time.Second)
 	if runErr != nil && !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, context.DeadlineExceeded) {
 		fmt.Fprintf(os.Stderr, "error: %v\n", runErr)
 		os.Exit(2)
@@ -270,7 +273,13 @@ func main() {
 	}
 }
 
-func runJobs(ctx context.Context, src JobSource, maxParallel int, stopOnError bool, printCmd bool) (int, int, int, error) {
+type runningJob struct {
+	job         Job
+	startTime   time.Time
+	lastWarning time.Time
+}
+
+func runJobs(ctx context.Context, src JobSource, maxParallel int, stopOnError bool, printCmd bool, warningThreshold time.Duration) (int, int, int, error) {
 	sema := make(chan struct{}, maxParallel)
 	var (
 		wg           sync.WaitGroup
@@ -281,19 +290,26 @@ func runJobs(ctx context.Context, src JobSource, maxParallel int, stopOnError bo
 		nextToStart  int
 		countMu      sync.Mutex
 		progressMu   sync.Mutex
+		runningMu    sync.Mutex
 		successCount int
 		failCount    int
 		totalJobs    int
 		finishedJobs int
+		runningJobs  = make(map[int]*runningJob)
 	)
 	ctx, cancelFn = context.WithCancel(ctx)
 	defer cancelFn()
 
-	// Setup progress bar if TTY
-	showProgress := isTerminal(os.Stdout)
+	// Setup progress bar if TTY (use stderr to avoid interfering with job stdout)
+	showProgress := isTerminal(os.Stderr)
 	if showProgress {
-		// Save cursor position
-		fmt.Print("\033[s")
+		// Save cursor position and show initial progress bar
+		fmt.Fprint(os.Stderr, "\033[s")
+		// Move to bottom and show initial state
+		fmt.Fprint(os.Stderr, "\033[999;1H\033[K")
+		fmt.Fprint(os.Stderr, "\033[32m[0/0] jobs completed (success: 0, failed: 0)\033[0m")
+		fmt.Fprint(os.Stderr, "\033[u")
+		os.Stderr.Sync()
 	}
 
 	updateProgress := func() {
@@ -309,15 +325,57 @@ func runJobs(ctx context.Context, src JobSource, maxParallel int, stopOnError bo
 		failed := failCount
 		countMu.Unlock()
 		// Save current position, move to bottom, print progress, restore position
-		fmt.Print("\033[s")      // Save cursor
-		fmt.Print("\033[999;1H") // Move to row 999, col 1 (bottom)
-		fmt.Print("\033[K")      // Clear line
+		fmt.Fprint(os.Stderr, "\033[s")      // Save cursor
+		fmt.Fprint(os.Stderr, "\033[999;1H") // Move to row 999, col 1 (bottom)
+		fmt.Fprint(os.Stderr, "\033[K")      // Clear line
 		if total > 0 {
-			fmt.Print("\033[32m") // Green color
-			fmt.Printf("[%d/%d] jobs completed (success: %d, failed: %d)", finished, total, success, failed)
-			fmt.Print("\033[0m") // Reset color
+			fmt.Fprint(os.Stderr, "\033[32m") // Green color
+			fmt.Fprintf(os.Stderr, "[%d/%d] jobs completed (success: %d, failed: %d)", finished, total, success, failed)
+			fmt.Fprint(os.Stderr, "\033[0m") // Reset color
 		}
-		fmt.Print("\033[u") // Restore cursor
+		fmt.Fprint(os.Stderr, "\033[u") // Restore cursor
+		os.Stderr.Sync()                // Flush to ensure progress bar is visible
+	}
+
+	// Start warning goroutine to check for long-running jobs
+	// Use a separate context so we can cancel it without affecting running jobs
+	var warningCtx context.Context
+	var warningCancel context.CancelFunc
+	if warningThreshold > 0 {
+		warningCtx, warningCancel = context.WithCancel(context.Background())
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-warningCtx.Done():
+					return
+				case <-ticker.C:
+					now := time.Now()
+					runningMu.Lock()
+					for _, rj := range runningJobs {
+						elapsed := now.Sub(rj.startTime)
+						if elapsed >= warningThreshold {
+							// Check if we need to print a warning (every threshold interval)
+							timeSinceLastWarning := now.Sub(rj.lastWarning)
+							if rj.lastWarning.IsZero() || timeSinceLastWarning >= warningThreshold {
+								cmdStr := formatCommand(rj.job.Cmd, rj.job.Args)
+								fmt.Fprintf(os.Stderr, "\n[WARNING] Job %s has been running for %s: %s\n", rj.job.ID, elapsed.Round(time.Second), cmdStr)
+								rj.lastWarning = now
+							}
+						}
+					}
+					hasRunningJobs := len(runningJobs) > 0
+					runningMu.Unlock()
+					// Exit if no running jobs (all jobs finished)
+					if !hasRunningJobs {
+						return
+					}
+				}
+			}
+		}()
 	}
 
 	var iterationErr error
@@ -365,6 +423,10 @@ func runJobs(ctx context.Context, src JobSource, maxParallel int, stopOnError bo
 			case sema <- struct{}{}:
 				defer func() { <-sema }()
 			case <-ctx.Done():
+				// Remove from tracking if it was added
+				runningMu.Lock()
+				delete(runningJobs, idx)
+				runningMu.Unlock()
 				countMu.Lock()
 				failCount++
 				finishedJobs++
@@ -379,7 +441,22 @@ func runJobs(ctx context.Context, src JobSource, maxParallel int, stopOnError bo
 			}
 			startMu.Unlock()
 
+			// Track job start
+			jobStartTime := time.Now()
+			runningMu.Lock()
+			runningJobs[idx] = &runningJob{
+				job:       job,
+				startTime: jobStartTime,
+			}
+			runningMu.Unlock()
+
 			exitCode, err := runOne(ctx, job, printCmd, release)
+
+			// Remove job from tracking
+			runningMu.Lock()
+			delete(runningJobs, idx)
+			runningMu.Unlock()
+
 			countMu.Lock()
 			finishedJobs++
 			if err != nil || exitCode != 0 {
@@ -399,10 +476,16 @@ func runJobs(ctx context.Context, src JobSource, maxParallel int, stopOnError bo
 
 	wg.Wait()
 
+	// Cancel warning context if it was created
+	if warningCancel != nil {
+		warningCancel()
+	}
+
 	// Clear progress bar
 	if showProgress {
-		fmt.Print("\033[999;1H\033[K") // Move to bottom and clear
-		fmt.Print("\033[u")            // Restore original cursor position
+		fmt.Fprint(os.Stderr, "\033[999;1H\033[K") // Move to bottom and clear
+		fmt.Fprint(os.Stderr, "\033[u")            // Restore original cursor position
+		os.Stderr.Sync()
 	}
 
 	return successCount, failCount, totalJobs, iterationErr
