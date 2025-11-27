@@ -1,0 +1,8 @@
+# Python dependencies for mytools/py
+# Currently all tools use only standard library modules
+# Add dependencies here as needed for future tools
+
+# Example future dependencies:
+# requests>=2.25.0
+# pandas>=1.3.0
+# click>=8.0.0

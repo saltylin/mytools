@@ -7,3 +7,4 @@ Collection of small utilities.
 ## Tools
 
 - [`runjobs`](runjobs/README.md): concurrency-limited runner for launching many subprocess jobs.
+- [`py`](py/README.md): Python-based command-line tools.
