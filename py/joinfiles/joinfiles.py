@@ -90,6 +90,7 @@ def join_files(file1_path: str, file2_path: str, index1: int, index2: int, outpu
     
     # Process file1 and perform joins
     print(f"Processing {file1_path} and writing results to {output_path}...", file=sys.stderr)
+    print(f"Detected separator in {file2_path}: {'TAB' if file2_separator == chr(9) else repr(file2_separator)}", file=sys.stderr)
     
     try:
         with open(file1_path, 'r', encoding='utf-8') as f1, \
@@ -112,6 +113,7 @@ def join_files(file1_path: str, file2_path: str, index1: int, index2: int, outpu
                 # Detect separator from first non-empty line
                 if file1_total_lines == 1:
                     file1_separator = detect_separator(line)
+                    print(f"Detected separator in {file1_path}: {'TAB' if file1_separator == chr(9) else repr(file1_separator)}", file=sys.stderr)
                 
                 fields = split_fields(line)
                 key_value = get_field_value(fields, index1)
@@ -139,8 +141,18 @@ def join_files(file1_path: str, file2_path: str, index1: int, index2: int, outpu
                     # Join with each matching line from file2
                     matched_lines += 1
                     for match_line in matching_lines:
-                        # Use the separator from file1 for consistency
-                        joined_line = line + file1_separator + match_line
+                        # Determine the best separator for joining
+                        # Priority: 1) Tab if either file uses tab, 2) File1 separator, 3) Single space
+                        if file1_separator == '\t' or file2_separator == '\t':
+                            join_separator = '\t'
+                        elif file1_separator != ' ':
+                            join_separator = file1_separator
+                        elif file2_separator != ' ':
+                            join_separator = file2_separator
+                        else:
+                            join_separator = ' '  # Default fallback
+                        
+                        joined_line = line + join_separator + match_line
                         out.write(joined_line + '\n')
                         total_output_lines += 1
             

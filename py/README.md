@@ -4,40 +4,25 @@ This directory contains Python-based command-line tools.
 
 ## Tools
 
-### joinfiles.py
+### [joinfiles](joinfiles/README.md)
 
 SQL-like left join for text files based on field matching.
 
-**Usage:**
+**Quick Usage:**
 ```bash
-./joinfiles.py file1.txt file2.txt -k index1,index2 [-o output.txt]
+cd joinfiles
+python3 joinfiles.py file1.txt file2.txt -k 1,2 -o result.txt
 ```
 
-**Description:**
-Performs a left join operation on two text files where each line contains whitespace-separated fields. For each line in file1, looks up matching lines in file2 based on field values at specified indexes (1-based). If matches are found, concatenates the lines; if no matches, outputs the original file1 line.
+### [dbload](dbload/README.md)
 
-**Arguments:**
-- `file1.txt`: First input file (left side of join)
-- `file2.txt`: Second input file (right side of join) 
-- `-k, --keys`: Join keys as "index1,index2" where index1 is field in file1 and index2 is field in file2 (1-based)
-- `-o, --output`: Output file (default: joins.txt)
+Interactive database loader with auto-detection for CSV, JSON, and text files.
 
-**Examples:**
+**Quick Usage:**
 ```bash
-# Join employee.txt with department.txt where employee's dept_id (field 3) 
-# matches department's id (field 1)
-./joinfiles.py employee.txt department.txt -k 3,1 -o employee_with_dept.txt
-
-# Join file1.txt and file2.txt on field 1 of file1 matching field 2 of file2
-./joinfiles.py file1.txt file2.txt -k 1,2
+cd dbload
+python3 dbload.py data.csv --db mydata.db
 ```
-
-**Features:**
-- Handles both space and tab separators
-- Preserves original whitespace format from file1
-- Multiple matches create multiple output lines
-- Progress reporting to stderr
-- Proper error handling for missing files/fields
 
 ## Setup
 
